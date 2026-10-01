@@ -131,3 +131,5 @@ internet.
 | `serve.rs` | WebSocket transport + device token |
 | `config.rs` | session discovery, socket paths |
 | `doctor.rs` | diagnostics |
+
+<!-- install: curl … | sh ; see install.sh -->
