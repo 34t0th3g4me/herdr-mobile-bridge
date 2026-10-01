@@ -47,7 +47,9 @@ try_prebuilt() {
   # Verify the checksum when the release publishes one.
   if curl -fsSL "$base/SHA256SUMS" -o "$TMP/SHA256SUMS" 2>/dev/null; then
     expected="$(awk -v f="$asset" '$2==f {print $1}' "$TMP/SHA256SUMS")"
-    [ -n "$expected" ] || die "no checksum for $asset in SHA256SUMS"
+    # No entry for our asset (a release gap) is not an integrity failure:
+    # fall back to building from source instead of trusting the tarball.
+    [ -n "$expected" ] || return 1
     if command -v sha256sum >/dev/null 2>&1; then
       actual="$(sha256sum "$TMP/$asset" | awk '{print $1}')"
     else
