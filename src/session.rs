@@ -44,8 +44,10 @@ pub const PUMP_INTERVAL: Duration = Duration::from_millis(25);
 /// One bridge session bound to a single Herdr server socket.
 pub struct Session {
     bridge: Bridge,
-    /// Write idempotency: key → previous result.
+    /// Write idempotency: key → previous result, capped in [`Self::remember`].
     seen: HashMap<String, Value>,
+    /// Insertion order of `seen`, used to evict the oldest key.
+    order: std::collections::VecDeque<String>,
     subscribed: bool,
 }
 
@@ -64,6 +66,7 @@ impl Session {
         Ok(Session {
             bridge: Bridge::new(client, info),
             seen: HashMap::new(),
+            order: std::collections::VecDeque::new(),
             subscribed: false,
         })
     }
@@ -146,7 +149,10 @@ impl Session {
                     Err(e) => vec![error_with_code(&id, &session, "read_failed", &e)],
                 }
             }
-            ClientFrame::Resume { .. } | ClientFrame::TimelineSubscribe { .. } => vec![Frame::reply(
+            // The reference acknowledges `timeline.subscribe` with a silent ack
+            // (no payload) and answers `resume` with nothing at all.
+            ClientFrame::Resume { .. } => Vec::new(),
+            ClientFrame::TimelineSubscribe { .. } => vec![Frame::reply(
                 &id,
                 "ack",
                 &session,
@@ -180,25 +186,37 @@ impl Session {
 
     fn handle_write(&mut self, id: &str, session: &str, frame: &ClientFrame) -> Vec<Frame> {
         let (kind, payload, key) = write_parts(frame);
-        let duplicate = key.as_ref().is_some_and(|k| self.seen.contains_key(k));
-        let mut out = vec![Frame::reply(
+        // Herdr replays are unsafe without a key, so the app must supply the
+        // field; this is the reference bridge's `idempotency_required` contract.
+        // An empty string still counts as present, matching the reference.
+        let Some(key) = key else {
+            return vec![Frame::error(
+                id,
+                session,
+                "idempotency_required",
+                "write requires idempotencyKey",
+            )];
+        };
+
+        let duplicate = self.seen.contains_key(&key);
+        let ack = Frame::reply(
             id,
             "ack",
             session,
             json!({ "duplicate": duplicate, "requestId": id }),
-        )];
+        );
+        // A replayed write is acknowledged but produces no second result — the
+        // reference bridge stops after the duplicate ack.
+        if duplicate {
+            return vec![ack];
+        }
+        let mut out = vec![ack];
 
-        if !duplicate {
-            match self.bridge.write(&kind, &payload) {
-                Ok(result) => {
-                    if let Some(k) = key {
-                        self.seen.insert(k, result);
-                    }
-                }
-                Err(e) => {
-                    out.push(error_for(id, session, &e));
-                    return out;
-                }
+        match self.bridge.write(&kind, &payload) {
+            Ok(result) => self.remember(&key, result),
+            Err(e) => {
+                out.push(error_for(id, session, &e));
+                return out;
             }
         }
         out.push(Frame::reply(
@@ -208,6 +226,20 @@ impl Session {
             json!({ "ok": true, "requestId": id }),
         ));
         out
+    }
+
+    /// Remember a write result, bounding the cache so a long-lived connection
+    /// cannot grow without limit. Older entries are evicted first.
+    fn remember(&mut self, key: &str, result: Value) {
+        const MAX_REMEMBERED: usize = 512;
+        if self.seen.len() >= MAX_REMEMBERED {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        if self.seen.insert(key.to_string(), result).is_none() {
+            self.order.push_back(key.to_string());
+        }
     }
 }
 
