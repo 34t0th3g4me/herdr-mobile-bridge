@@ -6,7 +6,9 @@
 
 use crate::herdr::{HerdrClient, HerdrError};
 use crate::proto::{Frame, PROTOCOL_VERSION};
+use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 /// Capability list advertised in `hello.result`. Matches the reference build.
 pub const CAPABILITIES: &[&str] = &[
@@ -45,33 +47,41 @@ impl ServerInfo {
 }
 
 /// Per-connection bridge state: the socket plus the monotonic event sequence.
+/// Shared fields are `Arc`-backed so the socket client and sequence counter can
+/// be used from worker threads while the session keeps handling requests.
 pub struct Bridge {
     client: HerdrClient,
-    info: ServerInfo,
-    seq: u64,
+    info: Arc<ServerInfo>,
+    seq: Arc<Mutex<u64>>,
 }
 
 impl Bridge {
     pub fn new(client: HerdrClient, info: ServerInfo) -> Self {
-        Bridge { client, info, seq: 0 }
+        Bridge {
+            client,
+            info: Arc::new(info),
+            seq: Arc::new(Mutex::new(0)),
+        }
     }
 
-    pub fn info(&self) -> &ServerInfo {
-        &self.info
+    pub fn session_name(&self) -> &str {
+        &self.info.session
     }
 
     pub fn client(&self) -> &HerdrClient {
         &self.client
     }
 
-    fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
+    #[allow(dead_code)]
+    fn next_seq(&self) -> u64 {
+        self.next_seq_public()
     }
 
-    /// Next event sequence number (exposed for callers that build events).
-    pub fn next_seq_public(&mut self) -> u64 {
-        self.next_seq()
+    /// Next event sequence number; safe to call from any thread.
+    pub fn next_seq_public(&self) -> u64 {
+        let mut s = self.seq.lock();
+        *s += 1;
+        *s
     }
 
     /// `hello.result` payload the app expects after its `hello`.
@@ -97,7 +107,7 @@ impl Bridge {
 
     /// `snapshot.get` → a `snapshot` frame whose payload nests Herdr's own
     /// `session.snapshot` verbatim under `snapshot`.
-    pub fn snapshot(&mut self) -> Result<Frame, HerdrError> {
+    pub fn snapshot(&self) -> Result<Frame, HerdrError> {
         let snap = self.client.snapshot()?;
         let seq = self.next_seq();
         Ok(Frame::event(
@@ -133,7 +143,7 @@ impl Bridge {
 
     /// Build a `timeline.batch` payload for the requested panes: the app paints
     /// each pane's TUI from these terminal blocks, keyed by pane id.
-    pub fn timeline_batch(&mut self, pane_ids: &[String]) -> Value {
+    pub fn timeline_batch(&self, pane_ids: &[String]) -> Value {
         let events: Vec<Value> = pane_ids
             .iter()
             .filter_map(|pane| self.timeline_event(pane))
@@ -145,32 +155,8 @@ impl Bridge {
     }
 
     /// One synthetic terminal event for a pane, from its current viewport.
-    pub fn timeline_event(&mut self, pane_id: &str) -> Option<Value> {
-        let mut params = Map::new();
-        params.insert("pane_id".into(), json!(pane_id));
-        params.insert("source".into(), json!("recent"));
-        let result = self.client.call("pane.read", Value::Object(params)).ok()?;
-        let text = result
-            .get("read")
-            .and_then(|r| r.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let timestamp = crate::proto::now_ms();
-        Some(json!({
-            "adapter": "unknown",
-            "blocks": [{ "text": text, "truncated": false, "type": "terminal" }],
-            "confidence": "heuristic",
-            "id": format!("terminal-{pane_id}-{timestamp}"),
-            "kind": "terminal",
-            "paneId": pane_id,
-            "seq": timestamp,
-            "serverId": "",
-            "sessionId": self.info.session,
-            "source": "terminal_fallback",
-            "spaceId": "",
-            "tabId": "",
-            "timestamp": timestamp,
-        }))
+    pub fn timeline_event(&self, pane_id: &str) -> Option<Value> {
+        timeline_event_for(&self.client, &self.info.session, pane_id)
     }
 
     /// Apply a mobile write frame and return the Herdr result.
@@ -235,7 +221,7 @@ impl Bridge {
     }
 
     /// Translate one pushed Herdr event into zero or more mobile frames.
-    pub fn project_event(&mut self, raw: &Value) -> Vec<Frame> {
+    pub fn project_event(&self, raw: &Value) -> Vec<Frame> {
         let Some(data) = raw.get("data") else {
             return Vec::new();
         };
@@ -309,7 +295,7 @@ impl Bridge {
         out
     }
 
-    fn agent_status_frame(&mut self, data: &Value) -> Frame {
+    fn agent_status_frame(&self, data: &Value) -> Frame {
         let seq = self.next_seq();
         // The pane's display title is its stripped terminal title; a pane with
         // no title yet (a fresh shell) falls back to its working directory, as
@@ -334,7 +320,7 @@ impl Bridge {
         Frame::event("agent.status", &self.info.session, seq, payload)
     }
 
-    fn resource_frame(&mut self, action: &str, data: &Value) -> Frame {
+    fn resource_frame(&self, action: &str, data: &Value) -> Frame {
         // `kind` is the entity family; `resource` is Herdr's own object. Close
         // events carry a trimmed object; rewrap it so consumers see the same
         // fields as the create path.
@@ -384,4 +370,36 @@ fn normalize_keys(keys: Option<&Value>) -> Value {
         Some(Value::Array(_)) => keys.cloned().unwrap(),
         _ => json!([]),
     }
+}
+
+/// Build one synthetic `terminal` timeline event for a pane. Free function so a
+/// worker thread can render a delta without holding the session lock.
+pub fn timeline_event_for(client: &HerdrClient, session: &str, pane_id: &str) -> Option<Value> {
+    let result = client
+        .call(
+            "pane.read",
+            serde_json::json!({ "pane_id": pane_id, "source": "recent" }),
+        )
+        .ok()?;
+    let text = result
+        .get("read")
+        .and_then(|r| r.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let timestamp = crate::proto::now_ms();
+    Some(serde_json::json!({
+        "adapter": "unknown",
+        "blocks": [{ "text": text, "truncated": false, "type": "terminal" }],
+        "confidence": "heuristic",
+        "id": format!("terminal-{pane_id}-{timestamp}"),
+        "kind": "terminal",
+        "paneId": pane_id,
+        "seq": timestamp,
+        "serverId": "",
+        "sessionId": session,
+        "source": "terminal_fallback",
+        "spaceId": "",
+        "tabId": "",
+        "timestamp": timestamp,
+    }))
 }

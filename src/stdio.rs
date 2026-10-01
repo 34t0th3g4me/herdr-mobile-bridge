@@ -1,7 +1,8 @@
 //! The SSH-exec (`stdio`) transport: newline-delimited JSON on stdin/stdout.
 //!
-//! The mobile app runs `herdr-mobile-bridge stdio --session <name>` over SSH;
-//! this module is the loop that keeps a [`Session`] fed and drained.
+//! The mobile app runs `herdr-mobile-bridge stdio --session <name>` over SSH.
+//! A dedicated writer thread drains the session's outbound queue, so a reply is
+//! written the moment a worker produces it — no per-tick latency.
 
 use crate::proto::Frame;
 use crate::session::{Session, PUMP_INTERVAL};
@@ -10,8 +11,25 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 
 /// Run a stdio bridge session until the app closes stdin.
 pub fn run(socket_path: &str, session_name: &str) -> std::io::Result<()> {
-    let mut session = Session::connect(socket_path, session_name)?;
+    let session = Session::connect(socket_path, session_name)?;
 
+    // Writer thread: owns stdout and flushes every frame immediately.
+    let out_rx = session
+        .take_out_receiver()
+        .ok_or_else(|| std::io::Error::other("outbound queue already taken"))?;
+    let writer = std::thread::Builder::new()
+        .name("stdout".into())
+        .spawn(move || {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            while let Ok(frame) = out_rx.recv() {
+                if write_frame(&mut out, &frame).is_err() {
+                    break;
+                }
+            }
+        })?;
+
+    // Reader thread: one line per client frame, forwarded to this loop.
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::Builder::new()
         .name("stdin".into())
@@ -28,26 +46,19 @@ pub fn run(socket_path: &str, session_name: &str) -> std::io::Result<()> {
             }
         })?;
 
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-
     loop {
-        for frame in session.pump_events() {
-            write_frame(&mut out, &frame)?;
-        }
+        session.pump_events();
         match rx.recv_timeout(PUMP_INTERVAL) {
             Ok(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                for frame in session.handle_line(&line) {
-                    write_frame(&mut out, &frame)?;
+                if !line.trim().is_empty() {
+                    session.handle_line(&line);
                 }
             }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    let _ = writer.join();
     Ok(())
 }
 

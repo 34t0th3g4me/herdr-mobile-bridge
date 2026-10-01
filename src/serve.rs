@@ -341,10 +341,11 @@ fn handle_client(
         Role::Control => "control",
         Role::Admin => "admin",
     };
-    let mut session = Session::connect_as(socket_path, session_name, role_name)?;
+    let session = Session::connect_as(socket_path, session_name, role_name)?;
 
     loop {
-        for frame in session.pump_events() {
+        session.pump_events();
+        for frame in session.drain_out() {
             ws.send(Message::Text(serde_json::to_string(&frame)?))?;
         }
         let incoming = match ws.read() {
@@ -383,7 +384,8 @@ fn handle_client(
             }))?))?;
             continue;
         }
-        for frame in session.handle_line(&text) {
+        session.handle_line(&text);
+        for frame in session.drain_out() {
             ws.send(Message::Text(serde_json::to_string(&frame)?))?;
         }
     }

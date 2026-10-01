@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
 
@@ -44,11 +45,13 @@ fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::R
     Ok(read)
 }
 
-/// A Herdr server endpoint. Cheap to clone; holds one event stream at most.
+/// A Herdr server endpoint. Cheap to clone (shared inner); every `call` opens
+/// its own socket, so clones are safe to use from different threads.
+#[derive(Clone)]
 pub struct HerdrClient {
-    socket_path: String,
-    next_id: AtomicU64,
-    events: Mutex<Option<Receiver<Value>>>,
+    socket_path: Arc<String>,
+    next_id: Arc<AtomicU64>,
+    events: Arc<Mutex<Option<Receiver<Value>>>>,
 }
 
 impl HerdrClient {
@@ -57,14 +60,14 @@ impl HerdrClient {
         // Fail fast when the socket is missing, as the reference build does.
         UnixStream::connect(socket_path)?;
         Ok(HerdrClient {
-            socket_path: socket_path.to_string(),
-            next_id: AtomicU64::new(1),
-            events: Mutex::new(None),
+            socket_path: Arc::new(socket_path.to_string()),
+            next_id: Arc::new(AtomicU64::new(1)),
+            events: Arc::new(Mutex::new(None)),
         })
     }
 
     fn open(&self) -> Result<UnixStream, HerdrError> {
-        let stream = UnixStream::connect(&self.socket_path).map_err(HerdrError::Transport)?;
+        let stream = UnixStream::connect(self.socket_path.as_str()).map_err(HerdrError::Transport)?;
         stream
             .set_read_timeout(Some(CALL_TIMEOUT))
             .map_err(HerdrError::Transport)?;
