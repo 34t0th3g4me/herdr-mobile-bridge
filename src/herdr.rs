@@ -12,22 +12,43 @@
 
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::Duration;
 
 /// How long a single request or the subscribe handshake may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Queued server events before the reader drops new ones. Bounded so a busy or
+/// hostile local peer cannot grow bridge memory without limit.
+const EVENT_QUEUE: usize = 1024;
+
+/// Longest accepted protocol line, so a peer streaming bytes without a newline
+/// cannot grow an unbounded buffer. Applied per line, not per stream: `take()`
+/// on a `&mut R` is re-created for every call, so it caps a single line rather
+/// than the whole connection lifetime.
+const MAX_LINE: u64 = 8 * 1024 * 1024;
+
+/// Read one newline-delimited line, rejecting anything longer than [`MAX_LINE`].
+fn read_line_capped<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    buf.clear();
+    let read = reader.by_ref().take(MAX_LINE + 1).read_until(b'\n', buf)?;
+    if buf.len() as u64 > MAX_LINE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "protocol line exceeds maximum length",
+        ));
+    }
+    Ok(read)
+}
 
 /// A Herdr server endpoint. Cheap to clone; holds one event stream at most.
 pub struct HerdrClient {
     socket_path: String,
     next_id: AtomicU64,
     events: Mutex<Option<Receiver<Value>>>,
-    /// Keeps the subscribed socket alive for as long as this client exists.
-    event_stream: Mutex<Option<UnixStream>>,
 }
 
 impl HerdrClient {
@@ -39,7 +60,6 @@ impl HerdrClient {
             socket_path: socket_path.to_string(),
             next_id: AtomicU64::new(1),
             events: Mutex::new(None),
-            event_stream: Mutex::new(None),
         })
     }
 
@@ -66,20 +86,16 @@ impl HerdrClient {
         self.read_reply(&mut reader, &id)
     }
 
-    fn read_reply(
-        &self,
-        reader: &mut BufReader<UnixStream>,
-        id: &str,
-    ) -> Result<Value, HerdrError> {
-        let mut line = String::new();
+    fn read_reply<R: BufRead>(&self, reader: &mut R, id: &str) -> Result<Value, HerdrError> {
+        let mut line = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            match read_line_capped(reader, &mut line) {
                 Ok(0) => return Err(HerdrError::Closed),
                 Ok(_) => {}
                 Err(e) => return Err(HerdrError::Transport(e)),
             }
-            let trimmed = line.trim();
+            let trimmed = String::from_utf8_lossy(&line);
+            let trimmed = trimmed.trim();
             if trimmed.is_empty() {
                 continue;
             }
@@ -129,7 +145,9 @@ impl HerdrClient {
     }
 
     /// Subscribe on a dedicated, long-lived connection and stream events into
-    /// an internal channel. Re-subscribing replaces the previous stream.
+    /// an internal channel. Re-subscribing replaces the previous stream: the
+    /// old receiver is dropped, which disconnects its reader and closes that
+    /// socket, so no thread or file descriptor is leaked.
     pub fn subscribe(&self, subscriptions: Vec<Value>) -> Result<(), HerdrError> {
         let mut stream = self.open()?;
         stream
@@ -146,17 +164,19 @@ impl HerdrClient {
         stream.write_all(&line).map_err(HerdrError::Transport)?;
         stream.flush().map_err(HerdrError::Transport)?;
 
-        // The handshake reply shares the stream with the events that follow.
-        let reader_stream = stream.try_clone().map_err(HerdrError::Transport)?;
-        let (tx, rx) = mpsc::channel::<Value>();
-        let mut reader = BufReader::new(reader_stream);
+        // The stream is moved into the reader thread, which owns the socket for
+        // the lifetime of the subscription; the handshake reply is filtered out
+        // there. Dropping the receiver ends the loop and the socket.
+        let (tx, rx) = mpsc::sync_channel::<Value>(EVENT_QUEUE);
         std::thread::Builder::new()
             .name("herdr-events".into())
-            .spawn(move || read_events(&mut reader, &tx))
+            .spawn(move || {
+                let mut reader = BufReader::new(stream);
+                read_events(&mut reader, &tx)
+            })
             .map_err(HerdrError::Transport)?;
 
         *self.events.lock() = Some(rx);
-        *self.event_stream.lock() = Some(stream);
         Ok(())
     }
 
@@ -166,16 +186,17 @@ impl HerdrClient {
     }
 }
 
-/// Read until the socket closes, forwarding parsed event frames.
-fn read_events(reader: &mut BufReader<UnixStream>, tx: &Sender<Value>) {
-    let mut line = String::new();
+/// Read until the socket closes, forwarding parsed event frames. A full queue
+/// sheds the *newest* event rather than blocking the reader.
+fn read_events<R: BufRead>(reader: &mut R, tx: &SyncSender<Value>) {
+    let mut line = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        match read_line_capped(reader, &mut line) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let trimmed = line.trim();
+        let trimmed = String::from_utf8_lossy(&line);
+        let trimmed = trimmed.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -185,8 +206,12 @@ fn read_events(reader: &mut BufReader<UnixStream>, tx: &Sender<Value>) {
         let is_event = value.get("event").is_some()
             || value.get("data").is_some()
             || value.get("result").is_none();
-        if is_event && tx.send(value).is_err() {
-            break;
+        if is_event {
+            match tx.try_send(value) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            }
         }
     }
 }

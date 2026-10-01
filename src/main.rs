@@ -45,7 +45,13 @@ fn main() {
         }
         "--help" | "-h" | "help" => print!("{USAGE}"),
         "stdio" => {
-            let session = flag(rest, "--session").unwrap_or_else(|| "default".to_string());
+            let session = match session_flag(rest) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("herdr-mobile-bridge: {msg}");
+                    std::process::exit(2);
+                }
+            };
             let socket = config::session_socket(&session);
             if !socket.exists() {
                 eprintln!(
@@ -60,12 +66,16 @@ fn main() {
             }
         }
         "serve" => {
-            let session = flag(rest, "--session").unwrap_or_else(|| "default".to_string());
+            let session = match session_flag(rest) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("herdr-mobile-bridge: {msg}");
+                    std::process::exit(2);
+                }
+            };
             let listen = flag(rest, "--listen").unwrap_or_else(|| "127.0.0.1:8756".to_string());
             let socket = config::session_socket(&session);
-            let tokens = serve::TokenStore::new();
-            let token = tokens.load();
-            if let Err(e) = serve::run(&listen, &socket.to_string_lossy(), &session, token) {
+            if let Err(e) = serve::run(&listen, &socket.to_string_lossy(), &session) {
                 eprintln!("herdr-mobile-bridge: {e}");
                 std::process::exit(1);
             }
@@ -102,9 +112,22 @@ fn main() {
         }
         "doctor" => doctor::run(rest.iter().any(|a| a == "--json")),
         "pair" => {
-            let tokens = serve::TokenStore::new();
-            match tokens.generate() {
-                Ok(token) => println!("{token}"),
+            let role = match flag(rest, "--role").as_deref() {
+                Some("read") => serve::Role::Read,
+                Some("admin") => serve::Role::Admin,
+                Some("control") | None => serve::Role::Control,
+                Some(other) => {
+                    eprintln!("herdr-mobile-bridge: invalid role `{other}` (read|control|admin)");
+                    std::process::exit(2);
+                }
+            };
+            match serve::TokenStore::new().issue(role) {
+                Ok((record, token)) => {
+                    println!("Device ID: {}", record.id);
+                    println!("Role:      {}", record.role);
+                    println!("Token:     {token}");
+                    println!("The token is shown once; store it in the device secure store.");
+                }
                 Err(e) => {
                     eprintln!("herdr-mobile-bridge: {e}");
                     std::process::exit(1);
@@ -112,12 +135,13 @@ fn main() {
             }
         }
         "revoke" => {
-            let path = config::config_dir().join("bridge-device-token");
-            match std::fs::remove_file(path) {
-                Ok(()) => println!("device token revoked"),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    println!("no device token present")
-                }
+            let Some(device_id) = flag(rest, "--device-id") else {
+                eprintln!("herdr-mobile-bridge: revoke requires --device-id <id>");
+                std::process::exit(2);
+            };
+            match serve::TokenStore::new().revoke(&device_id) {
+                Ok(true) => println!("device {device_id} revoked"),
+                Ok(false) => println!("no device with id {device_id}"),
                 Err(e) => {
                     eprintln!("herdr-mobile-bridge: {e}");
                     std::process::exit(1);
@@ -137,4 +161,22 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// A `--session` value that is safe to interpolate into a socket path: a plain
+/// name, never a path. This keeps an operator typo or a hostile caller from
+/// pointing the bridge at an arbitrary `herdr.sock`.
+fn session_flag(args: &[String]) -> Result<String, String> {
+    let name = flag(args, "--session").unwrap_or_else(|| "default".to_string());
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if ok {
+        Ok(name)
+    } else {
+        Err(format!("invalid session name `{name}` (letters, digits, -_. only)"))
+    }
 }

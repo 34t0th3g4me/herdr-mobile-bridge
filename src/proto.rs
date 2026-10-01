@@ -86,19 +86,19 @@ fn next_frame_counter() -> u64 {
 #[serde(tag = "type")]
 pub enum ClientFrame {
     #[serde(rename = "hello")]
-    Hello { payload: HelloPayload },
+    Hello { #[allow(dead_code)] payload: HelloPayload },
     #[serde(rename = "ping")]
     Ping,
     #[serde(rename = "session.list")]
     SessionList,
     #[serde(rename = "snapshot.get")]
-    SnapshotGet { payload: SnapshotGetPayload },
+    SnapshotGet { #[allow(dead_code)] payload: SnapshotGetPayload },
     #[serde(rename = "raw.read")]
     RawRead { payload: RawReadPayload },
     #[serde(rename = "resume")]
-    Resume { payload: Value },
+    Resume { #[allow(dead_code)] payload: Value },
     #[serde(rename = "timeline.subscribe")]
-    TimelineSubscribe { payload: Value },
+    TimelineSubscribe { #[allow(dead_code)] payload: Value },
     #[serde(rename = "pane.sendText")]
     PaneSendText { payload: SendTextPayload },
     #[serde(rename = "pane.sendKeys")]
@@ -122,12 +122,13 @@ pub enum ClientFrame {
     #[serde(rename = "space.focus")]
     SpaceFocus { payload: WritePayload },
     #[serde(rename = "approval.respond")]
-    ApprovalRespond { payload: Value },
+    ApprovalRespond { #[allow(dead_code)] payload: Value },
     #[serde(other)]
     Unsupported,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HelloPayload {
     #[serde(default, rename = "clientName")]
     pub client_name: Option<String>,
@@ -138,6 +139,7 @@ pub struct HelloPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct SnapshotGetPayload {
     #[serde(default, rename = "lastSeq")]
     pub last_seq: Option<u64>,
@@ -149,6 +151,7 @@ pub struct RawReadPayload {
     pub pane_id: String,
     #[serde(default)]
     pub lines: Option<u32>,
+    /// Herdr pane-read source; defaults to `recent` when absent.
     #[serde(default)]
     pub source: Option<String>,
 }

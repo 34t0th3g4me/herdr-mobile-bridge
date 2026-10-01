@@ -7,23 +7,17 @@ use serde_json::json;
 pub fn run(as_json: bool) {
     let config_dir = config::config_dir();
     let default_socket = config::session_socket("default");
-    let token = config::config_dir().join("bridge-device-token");
-    let audit_dir = config::config_dir().join("audit");
+    let token_store = crate::serve::TokenStore::new();
 
     let report = json!({
-        "audit": {
-            "configured": audit_dir.is_dir(),
-            "directory_exists": audit_dir.is_dir(),
-        },
         "bridge_version": env!("CARGO_PKG_VERSION"),
         "config_dir_exists": config_dir.is_dir(),
         "default_listen": "127.0.0.1:8756",
         "default_socket_exists": default_socket.exists(),
-        "device_token_store_present": token.is_file(),
+        "paired_devices": token_store.active().len(),
         "herdr_binary_found": config::herdr_binary().is_some(),
-        "history_limit": "2048",
         "mobile_protocol": crate::proto::PROTOCOL_VERSION,
-        "session_allowlist_configured": std::env::var_os("HERDR_BRIDGE_SESSION_ALLOWLIST").is_some(),
+        "allowed_origins_configured": std::env::var_os("HERDR_MOBILE_ALLOWED_ORIGINS").is_some(),
     });
 
     if as_json {
@@ -48,4 +42,5 @@ pub fn run(as_json: bool) {
         "default socket:    {}",
         if default_socket.exists() { "ok" } else { "missing" }
     );
+    println!("paired devices:    {}", token_store.active().len());
 }

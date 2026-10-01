@@ -52,8 +52,19 @@ pub struct Session {
 }
 
 impl Session {
-    /// Connect to `socket_path`; `session_name` labels the mobile session.
+    /// Connect to `socket_path`; `session_name` labels the mobile session and
+    /// `role` is reported in `hello.result` (defaults to `admin` for the SSH
+    /// transport, where the OS account already gates access).
     pub fn connect(socket_path: &str, session_name: &str) -> std::io::Result<Self> {
+        Self::connect_as(socket_path, session_name, "admin")
+    }
+
+    /// Connect with an explicit advertised role.
+    pub fn connect_as(
+        socket_path: &str,
+        session_name: &str,
+        role: &str,
+    ) -> std::io::Result<Self> {
         let client = HerdrClient::connect(socket_path)?;
         let (protocol, version) = client.server_versions();
         let info = ServerInfo {
@@ -62,6 +73,7 @@ impl Session {
             herdr_version: version.unwrap_or_else(|| "unknown".to_string()),
             hostname: crate::config::hostname(),
             session: session_name.to_string(),
+            role: role.to_string(),
         };
         Ok(Session {
             bridge: Bridge::new(client, info),
@@ -119,10 +131,11 @@ impl Session {
             ClientFrame::Hello { .. } => {
                 if !self.subscribed {
                     let subs = SUBSCRIPTIONS.iter().map(|t| json!({ "type": t })).collect();
-                    // A failed subscription is non-fatal: the app still gets a
-                    // usable snapshot, events just stay quiet.
-                    let _ = self.bridge.client().subscribe(subs);
-                    self.subscribed = true;
+                    // A failed subscription is non-fatal, but is retried on a
+                    // later `hello` rather than latching the connection off.
+                    if self.bridge.client().subscribe(subs).is_ok() {
+                        self.subscribed = true;
+                    }
                 }
                 let payload = self.bridge.hello_payload();
                 vec![Frame::reply(&id, "hello.result", &session, payload)]
@@ -139,7 +152,7 @@ impl Session {
                 Err(e) => vec![error_with_code(&id, &session, "snapshot_failed", &e)],
             },
             ClientFrame::RawRead { payload } => {
-                match self.bridge.raw_read(&payload.pane_id, payload.lines) {
+                match self.bridge.raw_read(&payload.pane_id, payload.lines, payload.source.as_deref()) {
                     Ok(mut result) => {
                         result["requestId"] = json!(id);
                         vec![Frame::reply(&id, "raw.read.result", &session, result)]

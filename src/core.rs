@@ -34,6 +34,8 @@ pub struct ServerInfo {
     pub herdr_version: String,
     pub hostname: String,
     pub session: String,
+    /// Role advertised in `hello.result`; enforcement happens per frame.
+    pub role: String,
 }
 
 impl ServerInfo {
@@ -73,7 +75,7 @@ impl Bridge {
             "authRequired": false,
             "protocol": {
                 "degraded": ["approval.respond"],
-                "role": "admin",
+                "role": self.info.role,
                 "selected": PROTOCOL_VERSION,
                 "supported": [PROTOCOL_VERSION],
             },
@@ -102,10 +104,15 @@ impl Bridge {
     }
 
     /// `raw.read` → `pane.read` on Herdr, reshaped to `raw.read.result`.
-    pub fn raw_read(&self, pane_id: &str, lines: Option<u32>) -> Result<Value, HerdrError> {
+    pub fn raw_read(
+        &self,
+        pane_id: &str,
+        lines: Option<u32>,
+        source: Option<&str>,
+    ) -> Result<Value, HerdrError> {
         let mut params = Map::new();
         params.insert("pane_id".into(), json!(pane_id));
-        params.insert("source".into(), json!("recent"));
+        params.insert("source".into(), json!(source.unwrap_or("recent")));
         if let Some(l) = lines {
             params.insert("lines".into(), json!(l));
         }
