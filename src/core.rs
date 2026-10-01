@@ -69,6 +69,11 @@ impl Bridge {
         self.seq
     }
 
+    /// Next event sequence number (exposed for callers that build events).
+    pub fn next_seq_public(&mut self) -> u64 {
+        self.next_seq()
+    }
+
     /// `hello.result` payload the app expects after its `hello`.
     pub fn hello_payload(&self) -> Value {
         json!({
@@ -123,6 +128,48 @@ impl Bridge {
             "text": read.get("text").cloned().unwrap_or(Value::Null),
             "revision": read.get("revision").cloned().unwrap_or(Value::Null),
             "truncated": read.get("truncated").cloned().unwrap_or(Value::Bool(false)),
+        }))
+    }
+
+    /// Build a `timeline.batch` payload for the requested panes: the app paints
+    /// each pane's TUI from these terminal blocks, keyed by pane id.
+    pub fn timeline_batch(&mut self, pane_ids: &[String]) -> Value {
+        let events: Vec<Value> = pane_ids
+            .iter()
+            .filter_map(|pane| self.timeline_event(pane))
+            .collect();
+        json!({
+            "events": events,
+            "paneId": pane_ids.first().cloned().unwrap_or_default(),
+        })
+    }
+
+    /// One synthetic terminal event for a pane, from its current viewport.
+    pub fn timeline_event(&mut self, pane_id: &str) -> Option<Value> {
+        let mut params = Map::new();
+        params.insert("pane_id".into(), json!(pane_id));
+        params.insert("source".into(), json!("recent"));
+        let result = self.client.call("pane.read", Value::Object(params)).ok()?;
+        let text = result
+            .get("read")
+            .and_then(|r| r.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let timestamp = crate::proto::now_ms();
+        Some(json!({
+            "adapter": "unknown",
+            "blocks": [{ "text": text, "truncated": false, "type": "terminal" }],
+            "confidence": "heuristic",
+            "id": format!("terminal-{pane_id}-{timestamp}"),
+            "kind": "terminal",
+            "paneId": pane_id,
+            "seq": timestamp,
+            "serverId": "",
+            "sessionId": self.info.session,
+            "source": "terminal_fallback",
+            "spaceId": "",
+            "tabId": "",
+            "timestamp": timestamp,
         }))
     }
 

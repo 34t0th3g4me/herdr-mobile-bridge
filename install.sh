@@ -40,7 +40,12 @@ install_binary() {
 try_prebuilt() {
   [ -n "$triple" ] || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  base="https://github.com/$REPO/releases/latest/download"
+  # Resolve the tag via the API so we always fetch the exact release (the
+  # `releases/latest` alias is CDN-cached and can serve a stale asset).
+  tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$tag" ] || return 1
+  base="https://github.com/$REPO/releases/download/$tag"
   asset="$BIN-$triple.tar.gz"
   say "downloading $asset"
   curl -fsSL "$base/$asset" -o "$TMP/$asset" || return 1

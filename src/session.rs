@@ -49,6 +49,11 @@ pub struct Session {
     /// Insertion order of `seen`, used to evict the oldest key.
     order: std::collections::VecDeque<String>,
     subscribed: bool,
+    /// Panes whose terminal timeline the client subscribed to.
+    timeline_panes: std::collections::HashSet<String>,
+    /// Last time a delta was sent per pane, so a busy TUI cannot flood the
+    /// client (and this bridge) with a `pane.read` per output event.
+    last_delta_ms: HashMap<String, u64>,
 }
 
 impl Session {
@@ -80,6 +85,8 @@ impl Session {
             seen: HashMap::new(),
             order: std::collections::VecDeque::new(),
             subscribed: false,
+            timeline_panes: std::collections::HashSet::new(),
+            last_delta_ms: HashMap::new(),
         })
     }
 
@@ -90,8 +97,36 @@ impl Session {
     /// Frames triggered by Herdr server pushes since the last call.
     pub fn pump_events(&mut self) -> Vec<Frame> {
         let mut frames = Vec::new();
+        let mut changed: Vec<String> = Vec::new();
         while let Some(raw) = self.bridge.client().try_event() {
+            // A pane whose output changed also needs a terminal delta, so the
+            // app can repaint the visible TUI.
+            if let Some(pane) = pane_output_changed(&raw) {
+                if self.timeline_panes.contains(&pane) && !changed.contains(&pane) {
+                    changed.push(pane);
+                }
+            }
             frames.extend(self.bridge.project_event(&raw));
+        }
+        let now = crate::proto::now_ms();
+        for pane in changed {
+            // At most one delta per pane per window; a newer event refreshes it.
+            const DELTA_MIN_MS: u64 = 80;
+            if let Some(last) = self.last_delta_ms.get(&pane) {
+                if now.saturating_sub(*last) < DELTA_MIN_MS {
+                    continue;
+                }
+            }
+            self.last_delta_ms.insert(pane.clone(), now);
+            if let Some(event) = self.bridge.timeline_event(&pane) {
+                let seq = self.bridge.next_seq_public();
+                frames.push(Frame::event(
+                    "timeline.delta",
+                    &self.session_name().to_string(),
+                    seq,
+                    json!({ "event": event }),
+                ));
+            }
         }
         frames
     }
@@ -162,15 +197,33 @@ impl Session {
                     Err(e) => vec![error_with_code(&id, &session, "read_failed", &e)],
                 }
             }
-            // The reference acknowledges `timeline.subscribe` with a silent ack
-            // (no payload) and answers `resume` with nothing at all.
+            // `resume` is answered with nothing; `timeline.subscribe` yields a
+            // silent ack followed by a `timeline.batch` for the requested
+            // panes, which is what lets the app paint each pane's TUI.
             ClientFrame::Resume { .. } => Vec::new(),
-            ClientFrame::TimelineSubscribe { .. } => vec![Frame::reply(
-                &id,
-                "ack",
-                &session,
-                json!({ "duplicate": false, "requestId": id }),
-            )],
+            ClientFrame::TimelineSubscribe { payload } => {
+                let panes = payload.panes();
+                if panes.is_empty() {
+                    return vec![Frame::reply(
+                        &id,
+                        "ack",
+                        &session,
+                        json!({ "duplicate": false, "requestId": id }),
+                    )];
+                }
+                self.timeline_panes.extend(panes.iter().cloned());
+                let batch = self.bridge.timeline_batch(&panes);
+                let seq = self.bridge.next_seq_public();
+                vec![
+                    Frame::reply(
+                        &id,
+                        "ack",
+                        &session,
+                        json!({ "duplicate": false, "requestId": id }),
+                    ),
+                    Frame::event("timeline.batch", &session, seq, batch),
+                ]
+            }
             ClientFrame::ApprovalRespond { .. } => vec![Frame::error(
                 &id,
                 &session,
@@ -320,4 +373,23 @@ pub fn error_with_code(id: &str, session: &str, code: &str, e: &HerdrError) -> F
         code,
         &format!("herdr returned error {}", e.describe()),
     )
+}
+
+/// The pane id from a `pane_output_changed`/`pane.updated` server event.
+fn pane_output_changed(raw: &Value) -> Option<String> {
+    let data = raw.get("data")?;
+    let event = data.get("type").and_then(Value::as_str)?;
+    match event {
+        "pane_output_changed" => data
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        // Output changes also arrive as a full `pane_updated`.
+        "pane_updated" => data
+            .get("pane")
+            .and_then(|p| p.get("pane_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
 }

@@ -98,7 +98,7 @@ pub enum ClientFrame {
     #[serde(rename = "resume")]
     Resume { #[allow(dead_code)] payload: Value },
     #[serde(rename = "timeline.subscribe")]
-    TimelineSubscribe { #[allow(dead_code)] payload: Value },
+    TimelineSubscribe { payload: TimelineSubscribePayload },
     #[serde(rename = "pane.sendText")]
     PaneSendText { payload: SendTextPayload },
     #[serde(rename = "pane.sendKeys")]
@@ -154,6 +154,27 @@ pub struct RawReadPayload {
     /// Herdr pane-read source; defaults to `recent` when absent.
     #[serde(default)]
     pub source: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TimelineSubscribePayload {
+    /// Panes to stream terminal blocks for, as a list.
+    #[serde(default, rename = "paneIds")]
+    pub pane_ids: Vec<String>,
+    /// Single-pane form some clients send.
+    #[serde(default, rename = "paneId")]
+    pub pane_id: Option<String>,
+}
+
+impl TimelineSubscribePayload {
+    /// The panes to stream, accepting either `paneIds` or a single `paneId`.
+    pub fn panes(&self) -> Vec<String> {
+        if !self.pane_ids.is_empty() {
+            self.pane_ids.clone()
+        } else {
+            self.pane_id.iter().cloned().collect()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
