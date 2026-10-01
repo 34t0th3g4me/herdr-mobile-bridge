@@ -8,7 +8,25 @@ use crate::herdr::{HerdrClient, HerdrError};
 use crate::proto::{Frame, PROTOCOL_VERSION};
 use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Herdr emits `pane_updated` at spinner cadence — ~10 times a second per pane,
+/// each with a different terminal title and otherwise identical state. The
+/// reference bridge forwards every one of them, so the client repaints its whole
+/// agent list ten times a second and never gets to settle. Collapse those to
+/// edges: one `agent.status` per pane per real change (status, title, agent),
+/// with a slow keepalive for a client that missed the edge.
+pub const AGENT_STATUS_MIN_MS: u64 = 2000;
+
+/// Last `agent.status` state advertised per pane, used to suppress the spinner
+/// churn described on [`AGENT_STATUS_MIN_MS`].
+#[derive(Debug, Clone)]
+pub struct AgentStatusState {
+    /// Stable identity of the advert: pane, status, agent and title.
+    pub key: String,
+    pub last_ms: u64,
+}
 
 /// Capability list advertised in `hello.result`. Matches the reference build.
 pub const CAPABILITIES: &[&str] = &[
@@ -53,6 +71,48 @@ pub struct Bridge {
     client: HerdrClient,
     info: Arc<ServerInfo>,
     seq: Arc<Mutex<u64>>,
+    /// Pane id → last advertised status, for spinner coalescing.
+    agent_status: Mutex<HashMap<String, AgentStatusState>>,
+}
+
+/// Whether an `agent.status` advert is worth emitting: on a real change of the
+/// advertised identity, or on the keepalive interval. Spinner churn (same
+/// identity) is dropped. Pure so the policy is unit-testable.
+fn agent_status_due(prev: Option<&AgentStatusState>, key: &str, now: u64) -> bool {
+    match prev {
+        Some(prev) => prev.key != key || now.saturating_sub(prev.last_ms) >= AGENT_STATUS_MIN_MS,
+        None => true,
+    }
+}
+
+/// Remove spinner glyphs from a title and collapse whitespace, so the braille
+/// frame a live pane rewrites ten times a second does not read as a change.
+/// Spinner frames are not information: the client animates its own indicator
+/// from `agentStatus`.
+fn strip_spinner(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut last_space = false;
+    for ch in title.chars() {
+        let spinner = matches!(ch,
+            '\u{2800}'..='\u{28FF}'            // braille spinners ⠋⠙⠹…
+            | '◐' | '◓' | '◑' | '◒'            // half-circle spinners
+            | '✳' | '✢' | '✱' | '✲' | '✶' | '✽'  // asterisk spinners
+            | '⏳' | '⌛');                     // hourglasses
+        if spinner {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if last_space {
+                continue;
+            }
+            last_space = true;
+            out.push(' ');
+        } else {
+            last_space = false;
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
 }
 
 impl Bridge {
@@ -61,6 +121,7 @@ impl Bridge {
             client,
             info: Arc::new(info),
             seq: Arc::new(Mutex::new(0)),
+            agent_status: Mutex::new(HashMap::new()),
         }
     }
 
@@ -236,26 +297,34 @@ impl Bridge {
         // full `pane_updated`; the app keys off the pane, so both project to an
         // `agent.status` frame.
         if event == "pane_agent_detected" {
-            out.push(self.agent_status_frame(data));
+            if let Some(frame) = self.project_agent_status(data) {
+                out.push(frame);
+            }
         } else if event == "pane_created" {
             // A freshly created pane is announced with an `unknown` status even
             // before any agent is detected.
             if let Some(pane) = data.get("pane") {
-                out.push(self.agent_status_frame(pane));
+                if let Some(frame) = self.project_agent_status(pane) {
+                    out.push(frame);
+                }
             }
         } else if event == "pane_updated" {
             // Only panes that actually own an agent produce a status frame;
             // the reference build stays quiet for plain terminals.
             if let Some(pane) = data.get("pane") {
                 if pane.get("agent").is_some() || pane.get("agent_session").is_some() {
-                    out.push(self.agent_status_frame(pane));
+                    if let Some(frame) = self.project_agent_status(pane) {
+                        out.push(frame);
+                    }
                 }
             }
         } else if event.starts_with("workspace_")
             && event.ends_with("_updated")
             && data.get("agent_status").is_some()
         {
-            out.push(self.agent_status_frame(data));
+            if let Some(frame) = self.project_agent_status(data) {
+                out.push(frame);
+            }
         }
 
         // Resource frames. `pane_updated` is a high-frequency output event and
@@ -293,6 +362,51 @@ impl Bridge {
             out.push(self.resource_frame(action, data));
         }
         out
+    }
+
+    /// A coalesced `agent.status`. The pane's live spinner rewrites its own
+    /// terminal title ~10 times a second, which the reference bridge relays
+    /// verbatim; that alone starves the client. Emit instead only when the
+    /// advertised identity (pane, status, agent, title) really changes, plus a
+    /// periodic keepalive so a client that missed an edge still converges.
+    /// Returns `None` for pure spinner churn, so no `seq` is consumed.
+    fn project_agent_status(&self, data: &Value) -> Option<Frame> {
+        let pane = data
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .or_else(|| data.get("workspace_id").and_then(Value::as_str))
+            .or_else(|| data.get("tab_id").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+        let key = format!(
+            "{}\u{1}{}\u{1}{}\u{1}{}",
+            pane,
+            data.get("agent_status").and_then(Value::as_str).unwrap_or(""),
+            data.get("agent").and_then(Value::as_str).unwrap_or(""),
+            strip_spinner(
+                &["terminal_title_stripped", "terminal_title", "title"]
+                    .iter()
+                    .filter_map(|k| data.get(*k))
+                    .find(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
+        );
+        let now = crate::proto::now_ms();
+        {
+            let mut seen = self.agent_status.lock();
+            if !agent_status_due(seen.get(&pane), &key, now) {
+                return None;
+            }
+            seen.insert(
+                pane,
+                AgentStatusState {
+                    key,
+                    last_ms: now,
+                },
+            );
+        }
+        Some(self.agent_status_frame(data))
     }
 
     fn agent_status_frame(&self, data: &Value) -> Frame {
@@ -402,4 +516,54 @@ pub fn timeline_event_for(client: &HerdrClient, session: &str, pane_id: &str) ->
         "tabId": "",
         "timestamp": timestamp,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn st(key: &str, last_ms: u64) -> AgentStatusState {
+        AgentStatusState { key: key.into(), last_ms }
+    }
+
+    #[test]
+    fn first_frame_always_emitted() {
+        assert!(agent_status_due(None, "w0:p1\u{1}working\u{1}omp\u{1}x", 1));
+    }
+
+    #[test]
+    fn spinner_churn_is_dropped() {
+        // Same normalized identity (spinner already stripped) within the window.
+        let prev = st("w0:p1\u{1}working\u{1}omp\u{1}\u{3c0} title", 1000);
+        assert!(!agent_status_due(Some(&prev), &prev.key, 1000 + AGENT_STATUS_MIN_MS - 1));
+    }
+
+    #[test]
+    fn keepalive_re_emits_after_window() {
+        let prev = st("w0:p1\u{1}working\u{1}omp\u{1}x", 1000);
+        assert!(agent_status_due(Some(&prev), &prev.key, 1000 + AGENT_STATUS_MIN_MS));
+    }
+
+    #[test]
+    fn real_change_is_immediate() {
+        let prev = st("w0:p1\u{1}working\u{1}omp\u{1}x", 1000);
+        // Any identity change — status, title, agent or pane — passes at once.
+        assert!(agent_status_due(Some(&prev), "w0:p1\u{1}blocked\u{1}omp\u{1}x", 1001));
+        assert!(agent_status_due(Some(&prev), "w0:p1\u{1}working\u{1}omp\u{1}build failed", 1001));
+    }
+
+    #[test]
+    fn spinner_glyphs_are_stripped() {
+        assert_eq!(strip_spinner("\u{3c0} \u{2807} title"), "\u{3c0} title");
+        assert_eq!(strip_spinner("\u{3c0} \u{2819} title"), "\u{3c0} title");
+        assert_eq!(strip_spinner("\u{3c0}   \u{2819}   title"), "\u{3c0} title");
+        assert_eq!(strip_spinner("plain title"), "plain title");
+    }
+
+    #[test]
+    fn a_real_title_change_still_emits() {
+        let a = strip_spinner("\u{3c0} \u{2807} build");
+        let b = strip_spinner("\u{3c0} \u{2807} test");
+        assert_ne!(a, b);
+    }
 }

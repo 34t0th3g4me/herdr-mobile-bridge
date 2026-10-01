@@ -70,6 +70,14 @@ diffing every frame in both directions.
   Herdr protocol 22 has no verified semantic approval response.
 * Events: `agent.status`, `resource.created|updated|removed|focused`,
   `timeline.batch`, `timeline.delta`.
+* `agent.status` is **coalesced**. Herdr's `pane.updated` fires at spinner
+  cadence — ~10×/s per live pane — and the reference bridge relays every one,
+  so the client repaints its whole agent list ten times a second. This bridge
+  emits a frame only when the advertised identity (pane, status, agent, title
+  with spinner glyphs stripped) actually changes, plus a 2 s keepalive. A real
+  transition is still immediate; idle traffic drops from ~10/s to ~0.5/s.
+  Drop the `agentStatus`-derived spinner stripping only if a client ever needs
+  the raw braille frames.
 * `timeline.subscribe {paneIds:[…]}` is acknowledged, then answered with a
   `timeline.batch` carrying one `terminal` block per pane — this is what paints
   each pane's live TUI in the app. Subsequent pane output is streamed as
