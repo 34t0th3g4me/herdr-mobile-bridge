@@ -1,0 +1,21 @@
+[package]
+name = "herdr-mobile-bridge"
+version = "0.3.1"
+edition = "2021"
+description = "Bridge between the Herdr Mobile app and a Herdr server. Wire-compatible reimplementation of the 0.3.1 protocol, buildable on macOS (arm64) as well as Linux."
+license = "Apache-2.0"
+
+[[bin]]
+name = "herdr-mobile-bridge"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+parking_lot = "0.12"
+tungstenite = "0.24"
+
+[profile.release]
+opt-level = 2
+strip = true
