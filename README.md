@@ -68,7 +68,12 @@ diffing every frame in both directions.
   `snapshot_failed`, `herdr_unavailable`, `unsupported`, `capability_denied`,
   `capability_degraded`. `approval.respond` is always `capability_degraded` —
   Herdr protocol 22 has no verified semantic approval response.
-* Events: `agent.status`, `resource.created|updated|removed|focused`.
+* Events: `agent.status`, `resource.created|updated|removed|focused`,
+  `timeline.batch`, `timeline.delta`.
+* `timeline.subscribe {paneIds:[…]}` is acknowledged, then answered with a
+  `timeline.batch` carrying one `terminal` block per pane — this is what paints
+  each pane's live TUI in the app. Subsequent pane output is streamed as
+  `timeline.delta` (throttled per pane). `resume` is answered with nothing.
 * `raw.read` accepts `{paneId, lines?, source?}`; `source` defaults to `recent`.
 
 ### Herdr socket semantics (the subtle part)
