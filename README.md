@@ -24,17 +24,28 @@ herdr-mobile-bridge --version                         # must print 0.3.1
 installed version against the bundled one and would otherwise force a
 re-upload.
 
-## Install on macOS
+## Install (macOS and Linux)
 
 ```sh
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/34t0th3g4me/herdr-mobile-bridge/main/install.sh | sh
+```
+
+Installs to `~/.local/bin` (no sudo). The script prefers a prebuilt release
+binary for your OS/arch, verifies its **SHA-256** against the release's
+`SHA256SUMS`, and falls back to `cargo install --git … --locked` when no
+prebuilt exists. Set `PREFIX=/usr/local` to install elsewhere.
+
+Manual build:
+
+```sh
+cargo build --release --locked
 install -m755 target/release/herdr-mobile-bridge ~/.local/bin/herdr-mobile-bridge
 ```
 
 The app probes `~/.local/bin/herdr-mobile-bridge`, `/usr/local/bin/...` and
 `~/.cargo/bin/...` and runs `herdr-mobile-bridge stdio --session <name>` over
-SSH exec. With an `sshd_config` `ForceCommand` dispatcher (POSIX-sh wrapper for
-fish), that is the only wiring needed.
+SSH exec. That is the whole setup: the bridge is started per SSH connection, no
+socket is opened and no background service is installed.
 
 ## Protocol notes
 
