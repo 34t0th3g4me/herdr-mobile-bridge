@@ -100,6 +100,21 @@ enum Job {
     Delta {
         pane: String,
     },
+    Snapshot {
+        id: String,
+        session: String,
+    },
+    RawRead {
+        id: String,
+        session: String,
+        pane: String,
+        lines: Option<u32>,
+        source: Option<String>,
+    },
+    TimelineBatch {
+        session: String,
+        panes: Vec<String>,
+    },
 }
 
 /// One bridge session bound to a single Herdr server socket.
@@ -287,34 +302,25 @@ impl Session {
                 json!({ "sessions": [{ "name": session, "reachable": true, "socketPath": "" }] }),
             )),
             ClientFrame::SnapshotGet { .. } => {
-                let bridge = Arc::clone(&self.bridge);
-                let out = self.out_tx.clone();
-                spawn_blocking(move || match bridge.snapshot() {
-                    Ok(frame) => {
-                        let _ = out.send(frame);
-                    }
-                    Err(e) => {
-                        let _ = out.send(error_with_code(&id, &session, "snapshot_failed", &e));
-                    }
-                });
+                let job = Job::Snapshot {
+                    id: id.clone(),
+                    session: session.clone(),
+                };
+                if self.jobs.try_send(job).is_err() {
+                    self.emit(Frame::error(&id, &session, "snapshot_failed", "bridge is busy"));
+                }
             }
             ClientFrame::RawRead { payload } => {
-                let bridge = Arc::clone(&self.bridge);
-                let out = self.out_tx.clone();
-                let pane = payload.pane_id.clone();
-                let lines = payload.lines;
-                let source = payload.source.clone();
-                spawn_blocking(move || {
-                    match bridge.raw_read(&pane, lines, source.as_deref()) {
-                        Ok(mut result) => {
-                            result["requestId"] = json!(id);
-                            let _ = out.send(Frame::reply(&id, "raw.read.result", &session, result));
-                        }
-                        Err(e) => {
-                            let _ = out.send(error_with_code(&id, &session, "read_failed", &e));
-                        }
-                    }
-                });
+                let job = Job::RawRead {
+                    id: id.clone(),
+                    session: session.clone(),
+                    pane: payload.pane_id,
+                    lines: payload.lines,
+                    source: payload.source,
+                };
+                if self.jobs.try_send(job).is_err() {
+                    self.emit(Frame::error(&id, &session, "read_failed", "bridge is busy"));
+                }
             }
             // `resume` is answered with nothing.
             ClientFrame::Resume { .. } => {}
@@ -336,13 +342,13 @@ impl Session {
                     &session,
                     json!({ "duplicate": false, "requestId": id }),
                 ));
-                let bridge = Arc::clone(&self.bridge);
-                let out = self.out_tx.clone();
-                spawn_blocking(move || {
-                    let batch = bridge.timeline_batch(&panes);
-                    let seq = bridge.next_seq_public();
-                    let _ = out.send(Frame::event("timeline.batch", &session, seq, batch));
-                });
+                if self
+                    .jobs
+                    .try_send(Job::TimelineBatch { session: session.clone(), panes })
+                    .is_err()
+                {
+                    // No batch available; the client keeps its last timeline.
+                }
             }
             ClientFrame::ApprovalRespond { .. } => self.emit(Frame::error(
                 &id,
@@ -459,6 +465,34 @@ fn worker(
                     let _ = out.send(error_for(&id, &session, &e));
                 }
             },
+            Job::Snapshot { id, session } => match bridge.snapshot() {
+                Ok(frame) => {
+                    let _ = out.send(frame);
+                }
+                Err(e) => {
+                    let _ = out.send(error_with_code(&id, &session, "snapshot_failed", &e));
+                }
+            },
+            Job::RawRead {
+                id,
+                session,
+                pane,
+                lines,
+                source,
+            } => match bridge.raw_read(&pane, lines, source.as_deref()) {
+                Ok(mut result) => {
+                    result["requestId"] = json!(id);
+                    let _ = out.send(Frame::reply(&id, "raw.read.result", &session, result));
+                }
+                Err(e) => {
+                    let _ = out.send(error_with_code(&id, &session, "read_failed", &e));
+                }
+            },
+            Job::TimelineBatch { session, panes } => {
+                let batch = bridge.timeline_batch(&panes);
+                let seq = bridge.next_seq_public();
+                let _ = out.send(Frame::event("timeline.batch", &session, seq, batch));
+            }
             Job::Delta { pane } => {
                 if let Some(event) =
                     crate::core::timeline_event_for(bridge.client(), bridge.session_name(), &pane)
@@ -474,14 +508,6 @@ fn worker(
             }
         }
     }
-}
-
-/// Run a blocking body on a short-lived thread. Used for one-off calls that are
-/// not part of the bounded worker pool (snapshots, raw reads, batches).
-fn spawn_blocking<F: FnOnce() + Send + 'static>(body: F) {
-    let _ = std::thread::Builder::new()
-        .name("herdr-call".into())
-        .spawn(body);
 }
 
 /// Split a write frame into `(mobile kind, payload, idempotency key)`.
