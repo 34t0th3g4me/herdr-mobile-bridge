@@ -107,6 +107,18 @@ projected from `pane.updated`/`pane.agent_detected`/`pane_created` instead.
 The transport is plain `ws://` — put it behind Tailscale/WireGuard, not the open
 internet.
 
+## Security summary
+
+* **SSH (`stdio`) is the recommended mode.** Authentication and transport are
+  whatever SSH already provides; the bridge opens no socket and installs no
+  service. Pairing, tokens and origins do not apply.
+* **`serve`** authenticates with hashed device tokens (constant-time compare,
+  rejected before the WebSocket upgrade), refuses browser origins unless
+  allowlisted, enforces `read`/`control`/`admin` roles, caps concurrent clients,
+  and never binds beyond loopback unless you ask.
+* Session names are validated, so `--session` cannot escape the sessions
+  directory.
+
 ## Layout
 
 | file | role |
